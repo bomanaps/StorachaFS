@@ -1,3 +1,3 @@
-module github.com/Fatumayattani/StorachaFS
+module github.com/ABD-AZE/StorachaFS
 
-go 1.22.2
+go 1.22.3
