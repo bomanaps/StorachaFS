@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -185,6 +187,46 @@ func (c *storachaClient) OpenReader(cid, p string) (io.ReadSeeker, uint64, error
 		log.Printf("Fetching URL: %s", url)
 	}
 
+	// First, make a HEAD request to get the file size
+	resp, err := http.Head(url)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get file info: %w", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Failed to close response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, 0, fmt.Errorf("HTTP request failed with status: %s", resp.Status)
+	}
+
+	// Get the content length
+	size := resp.ContentLength
+	if size < 0 {
+		// If Content-Length is not available, fall back to the old method
+		if c.debug {
+			log.Printf("Content-Length not available, falling back to full download for CID %s", cid)
+		}
+		return c.openReaderFallback(url)
+	}
+
+	if c.debug {
+		log.Printf("File size: %d bytes, using streaming reader", size)
+	}
+
+	// Create and return the streaming reader
+	streamReader := newHttpStreamReader(url, size, c.debug)
+	return streamReader, uint64(size), nil
+}
+
+// openReaderFallback provides the old behavior when streaming is not possible
+func (c *storachaClient) openReaderFallback(url string) (io.ReadSeeker, uint64, error) {
+	if c.debug {
+		log.Printf("Using fallback method for URL: %s", url)
+	}
+
 	resp, err := http.Get(url)
 	if err != nil {
 		return nil, 0, err
@@ -203,8 +245,152 @@ func (c *storachaClient) OpenReader(cid, p string) (io.ReadSeeker, uint64, error
 	return newBytesReadSeeker(data), uint64(len(data)), nil
 }
 
+// HttpStreamReader implements io.ReadSeeker using HTTP Range requests
+// This allows streaming large files without loading them entirely into memory
+type HttpStreamReader struct {
+	url      string
+	size     int64
+	offset   int64
+	client   *http.Client
+	debug    bool
+	mu       sync.Mutex // Protects concurrent access to offset
+	// Performance optimizations
+	lastRequestTime time.Time
+	requestCount    int64
+}
+
+// newHttpStreamReader creates a new streaming reader for HTTP resources
+func newHttpStreamReader(url string, size int64, debug bool) *HttpStreamReader {
+	return &HttpStreamReader{
+		url:    url,
+		size:   size,
+		offset: 0,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        10,
+				IdleConnTimeout:     30 * time.Second,
+				DisableCompression:  false,
+				MaxIdleConnsPerHost: 2,
+			},
+		},
+		debug:          debug,
+		lastRequestTime: time.Now(),
+		requestCount:   0,
+	}
+}
+
+// Read implements io.Reader by making HTTP Range requests
+func (r *HttpStreamReader) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.offset >= r.size {
+		return 0, io.EOF
+	}
+
+	// Calculate how many bytes we can read
+	remaining := r.size - r.offset
+	toRead := int64(len(p))
+	if toRead > remaining {
+		toRead = remaining
+	}
+
+	if toRead == 0 {
+		return 0, io.EOF
+	}
+
+	// Create HTTP request with Range header
+	req, err := http.NewRequest("GET", r.url, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set Range header for the specific chunk we need
+	endByte := r.offset + toRead - 1
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", r.offset, endByte)
+	req.Header.Set("Range", rangeHeader)
+
+	if r.debug {
+		r.requestCount++
+		log.Printf("HTTP Range request #%d: %s (offset: %d, size: %d)", r.requestCount, rangeHeader, r.offset, toRead)
+	}
+
+	// Make the request
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HTTP request failed with status: %s", resp.Status)
+	}
+
+	// Read the response body into our buffer
+	n, err := io.ReadFull(resp.Body, p[:toRead])
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return 0, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Update offset
+	r.offset += int64(n)
+
+	// Handle end of file
+	if r.offset >= r.size {
+		return n, io.EOF
+	}
+
+	return n, nil
+}
+
+// Seek implements io.Seeker by updating the internal offset
+func (r *HttpStreamReader) Seek(offset int64, whence int) (int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var newOffset int64
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset = r.offset + offset
+	case io.SeekEnd:
+		newOffset = r.size + offset
+	default:
+		return 0, errors.New("invalid whence value")
+	}
+
+	if newOffset < 0 {
+		return 0, errors.New("cannot seek to negative position")
+	}
+
+	if newOffset > r.size {
+		newOffset = r.size
+	}
+
+	r.offset = newOffset
+	return r.offset, nil
+}
+
+// GetStats returns performance statistics for the streaming reader
+func (r *HttpStreamReader) GetStats() map[string]interface{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	
+	return map[string]interface{}{
+		"total_requests": r.requestCount,
+		"current_offset": r.offset,
+		"file_size":      r.size,
+		"progress_pct":   float64(r.offset) / float64(r.size) * 100,
+		"last_request":   r.lastRequestTime,
+	}
+}
+
 // Simple ReadSeeker over a byte slice
 // Represents in-memory storage of files (only works for small files)
+// DEPRECATED: Use HttpStreamReader for better performance
 type bytesRS struct {
 	b   []byte
 	off int64
