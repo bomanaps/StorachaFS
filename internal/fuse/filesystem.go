@@ -248,12 +248,12 @@ func (c *storachaClient) openReaderFallback(url string) (io.ReadSeeker, uint64, 
 // HttpStreamReader implements io.ReadSeeker using HTTP Range requests
 // This allows streaming large files without loading them entirely into memory
 type HttpStreamReader struct {
-	url      string
-	size     int64
-	offset   int64
-	client   *http.Client
-	debug    bool
-	mu       sync.Mutex // Protects concurrent access to offset
+	url    string
+	size   int64
+	offset int64
+	client *http.Client
+	debug  bool
+	mu     sync.Mutex // Protects concurrent access to offset
 	// Performance optimizations
 	lastRequestTime time.Time
 	requestCount    int64
@@ -274,9 +274,9 @@ func newHttpStreamReader(url string, size int64, debug bool) *HttpStreamReader {
 				MaxIdleConnsPerHost: 2,
 			},
 		},
-		debug:          debug,
+		debug:           debug,
 		lastRequestTime: time.Now(),
-		requestCount:   0,
+		requestCount:    0,
 	}
 }
 
@@ -321,7 +321,11 @@ func (r *HttpStreamReader) Read(p []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("HTTP request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Failed to close response body: %v", err)
+		}
+	}()
 
 	// Check response status
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
@@ -378,7 +382,7 @@ func (r *HttpStreamReader) Seek(offset int64, whence int) (int64, error) {
 func (r *HttpStreamReader) GetStats() map[string]interface{} {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	
+
 	return map[string]interface{}{
 		"total_requests": r.requestCount,
 		"current_offset": r.offset,
@@ -580,6 +584,8 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 //     if d.client == nil{
 //        d.client = auth.CachedClients["pk"] || auth.CachedClients["email"]
 //     }
+//     client , _ = auth.EmailAuth(email)
+
 // }
 
 // func (d *StorachaDir) Mkdir(ctx context.Context, name string, mode uint32, umask uint32) (*fs.Inode, uint32, syscall.Errno) {

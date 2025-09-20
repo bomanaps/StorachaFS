@@ -117,7 +117,7 @@ func BenchmarkHttpStreamReader(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Reset to beginning
-		reader.Seek(0, io.SeekStart)
+		_, _ = reader.Seek(0, io.SeekStart)
 
 		// Read the entire file
 		for {
