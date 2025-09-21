@@ -2,12 +2,14 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"encoding/base64"
+	"sync"
+	"time"
 
 	"github.com/storacha/go-ucanto/core/delegation"
 	"github.com/storacha/go-ucanto/core/result"
@@ -18,14 +20,159 @@ import (
 	guppyDelegation "github.com/storacha/guppy/pkg/delegation"
 )
 
+// CachedClient holds a client with its creation time for expiration management
+type CachedClient struct {
+	Client    *client.Client
+	CreatedAt time.Time
+}
+
+// ClientCache manages cached authenticated clients with thread safety and expiration
+type ClientCache struct {
+	clients map[string]*CachedClient
+	mu      sync.RWMutex
+	ttl     time.Duration
+}
+
+// Global client cache instance
+var (
+	clientCache *ClientCache
+	once        sync.Once
+)
+
+// DefaultCacheTTL is the default time-to-live for cached clients (1 hour)
+const DefaultCacheTTL = 1 * time.Hour
+
+// getClientCache returns the singleton client cache instance
+func getClientCache() *ClientCache {
+	once.Do(func() {
+		clientCache = &ClientCache{
+			clients: make(map[string]*CachedClient),
+			ttl:     DefaultCacheTTL,
+		}
+	})
+	return clientCache
+}
+
+// Get retrieves a client from cache if it exists and hasn't expired
+func (c *ClientCache) Get(key string) (*client.Client, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	cached, exists := c.clients[key]
+	if !exists {
+		return nil, false
+	}
+
+	// Check if client has expired
+	if time.Since(cached.CreatedAt) > c.ttl {
+		// Remove expired client (will be cleaned up properly on next Set/Clear call)
+		log.Printf("Client cache: expired entry for key %s", key)
+		return nil, false
+	}
+
+	log.Printf("Client cache: hit for key %s", key)
+	return cached.Client, true
+}
+
+// Set stores a client in cache with current timestamp
+func (c *ClientCache) Set(key string, client *client.Client) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.clients[key] = &CachedClient{
+		Client:    client,
+		CreatedAt: time.Now(),
+	}
+	log.Printf("Client cache: stored client for key %s", key)
+
+	// Clean up expired entries while we have the lock
+	c.cleanupExpiredLocked()
+}
+
+// Delete removes a specific client from cache
+func (c *ClientCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.clients[key]; exists {
+		delete(c.clients, key)
+		log.Printf("Client cache: deleted client for key %s", key)
+	}
+}
+
+// Clear removes all clients from cache
+func (c *ClientCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	count := len(c.clients)
+	c.clients = make(map[string]*CachedClient)
+	log.Printf("Client cache: cleared %d cached clients", count)
+}
+
+// cleanupExpiredLocked removes expired entries (must be called with write lock held)
+func (c *ClientCache) cleanupExpiredLocked() {
+	now := time.Now()
+	expiredKeys := make([]string, 0)
+
+	for key, cached := range c.clients {
+		if now.Sub(cached.CreatedAt) > c.ttl {
+			expiredKeys = append(expiredKeys, key)
+		}
+	}
+
+	for _, key := range expiredKeys {
+		delete(c.clients, key)
+	}
+
+	if len(expiredKeys) > 0 {
+		log.Printf("Client cache: cleaned up %d expired entries", len(expiredKeys))
+	}
+}
+
+// Stats returns cache statistics
+func (c *ClientCache) Stats() (total int, ttl time.Duration) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return len(c.clients), c.ttl
+}
+
+// SetTTL updates the cache TTL
+func (c *ClientCache) SetTTL(ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.ttl = ttl
+	log.Printf("Client cache: TTL updated to %v", ttl)
+}
+
+// Legacy global cache variable for backward compatibility
+// Deprecated: Use the new ClientCache methods instead
 var CachedClients = make(map[string]*client.Client)
 
+// EmailAuth authenticates using email with caching support
 func EmailAuth(email string) (*client.Client, error) {
-	if _, ok := CachedClients[email]; ok {
-		return CachedClients[email], nil
+	cache := getClientCache()
+
+	// Try to get from cache first
+	if client, found := cache.Get(email); found {
+		return client, nil
 	}
-	CachedClients[email], _ = emailAuth(email)
-	return CachedClients[email], nil
+
+	// Not in cache or expired, authenticate
+	client, err := emailAuth(email)
+	if err != nil {
+		return nil, fmt.Errorf("email authentication failed: %w", err)
+	}
+
+	// Store in cache
+	cache.Set(email, client)
+
+	// Also update legacy cache for backward compatibility
+	CachedClients[email] = client
+
+	return client, nil
 }
 
 func emailAuth(email string) (*client.Client, error) {
@@ -73,9 +220,11 @@ type AuthConfig struct {
 // PrivateKeyAuth creates an authenticated client using private key + proofs
 func PrivateKeyAuth(config *AuthConfig) (*client.Client, error) {
 	cacheKey := fmt.Sprintf("pk:%s:%s:%s", config.PrivateKeyPath, config.ProofPath, config.SpaceDID)
+	cache := getClientCache()
 
-	if cl, ok := CachedClients[cacheKey]; ok {
-		return cl, nil
+	// Try to get from cache first
+	if client, found := cache.Get(cacheKey); found {
+		return client, nil
 	}
 
 	issuer, err := loadPrivateKey(config.PrivateKeyPath)
@@ -103,6 +252,10 @@ func PrivateKeyAuth(config *AuthConfig) (*client.Client, error) {
 		return nil, fmt.Errorf("failed to add proofs to client: %w", err)
 	}
 
+	// Store in cache
+	cache.Set(cacheKey, c)
+
+	// Also update legacy cache for backward compatibility
 	CachedClients[cacheKey] = c
 
 	// issuer implements principal.Signer so we can call DID() on it
@@ -123,7 +276,6 @@ func PrivateKeyAuthSimple(privateKeyPath, proofPath, spaceDID string) (*client.C
 }
 
 func loadPrivateKey(privateKeyPath string) (principal.Signer, error) {
-
 	if privateKeyPath == "" {
 		return nil, fmt.Errorf("private key path is empty")
 	}
@@ -279,4 +431,26 @@ func GetAuthMethodFromArgs(email, privateKeyPath, proofPath, spaceDID string) (s
 	}
 
 	return "none", nil
+}
+
+// Cache management functions for external use
+
+// ClearClientCache clears all cached clients
+func ClearClientCache() {
+	getClientCache().Clear()
+}
+
+// InvalidateClient removes a specific client from cache
+func InvalidateClient(key string) {
+	getClientCache().Delete(key)
+}
+
+// GetCacheStats returns current cache statistics
+func GetCacheStats() (total int, ttl time.Duration) {
+	return getClientCache().Stats()
+}
+
+// SetCacheTTL updates the cache time-to-live duration
+func SetCacheTTL(ttl time.Duration) {
+	getClientCache().SetTTL(ttl)
 }
